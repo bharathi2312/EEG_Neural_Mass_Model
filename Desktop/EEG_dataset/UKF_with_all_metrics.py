@@ -1,0 +1,150 @@
+import numpy as np
+from filterpy.kalman import UnscentedKalmanFilter as UKF
+from filterpy.kalman import MerweScaledSigmaPoints
+import matplotlib.pyplot as plt
+from scipy.integrate import odeint
+from scipy.signal import welch
+from scipy.stats import pearsonr, entropy
+from sklearn.metrics import mean_squared_error
+import Input_signal_construction as input
+from scipy.signal import butter, filtfilt
+
+np.random.seed(42)  # For reproducibility
+
+# --- Model Definition ---
+def jansen_rit_augmented(x, t, dt):
+    y = x[:6]
+    A, B, C = x[6:]
+
+    a, b = 100.0, 50.0
+    e0, v0, r = 2.5, 6.0, 0.56
+
+    def sigmoid(v):
+        return 2 * e0 / (1 + np.exp(r * (v0 - v)))
+
+    def squash(x, low, high):
+        return low + (high - low) / (1 + np.exp(-x))
+
+    A = squash(A, 3, 4)
+    B = squash(B, 20, 30)
+    C = squash(C, 100, 150)
+
+    y0, y1, y2, y3, y4, y5 = y
+    dy = np.zeros(6)
+    p = 0 # Random external input
+
+    dy[0] = y3
+    dy[1] = y4
+    dy[2] = y5
+    dy[3] = A * a * sigmoid(y1 - y2) - 2 * a * y3 - a ** 2 * y0
+    dy[4] = A * a * (p + C * sigmoid(C * y0)) - 2 * a * y4 - a ** 2 * y1
+    dy[5] = B * b * C * sigmoid(C * y0) - 2 * b * y5 - b ** 2 * y2
+
+    dydt = np.concatenate([dy, np.zeros(3)])
+    return x + dydt * dt
+
+
+def hx(x):
+    return np.array([x[1] - x[2]])
+
+
+# --- Filter Setup ---
+dt = 0.001
+points = MerweScaledSigmaPoints(n=9, alpha=0.1, beta=2., kappa=-1)
+ukf = UKF(dim_x=9, dim_z=1, fx=lambda x, dt: jansen_rit_augmented(x, 0, dt),
+          hx=hx, dt=dt, points=points)
+
+ukf.x = np.array([0.0] * 6 + [3.25, 22.0, 135.0])
+ukf.P *= 1
+ukf.Q *= 1
+ukf.R *= 500
+
+# --- EEG Data ---
+def bandpass_filter(data, lowcut, highcut, fs, order):
+    nyquist = 0.5 * fs
+    low = lowcut / nyquist
+    high = highcut / nyquist
+    b, a = butter(order, [low, high], btype='band')
+    return filtfilt(b, a, data)
+
+
+eeg_data = input.eeg_data[0].to_numpy()
+print(eeg_data.shape)
+filtered_eeg = []
+
+# --- Channel Loop ---
+for channel in range(eeg_data.shape[1]):
+    zs = bandpass_filter(eeg_data[:, channel], 0.5, 45,256,4)
+
+    filtered_states = []
+    
+    for z in zs:
+        ukf.predict()
+        ukf.update(np.array([z]))
+        ukf.x[:6] =np.clip(ukf.x[:6], -1000, 1000)
+        ukf.x[6] = np.clip(ukf.x[6], 3.0, 4.0)     # A
+        ukf.x[7] = np.clip(ukf.x[7], 20.0, 30.0)   # B
+        ukf.x[8] = np.clip(ukf.x[8], 100.0, 150.0) # C
+        filtered_states.append(ukf.x.copy())
+
+    filtered_states = np.array(filtered_states)
+    filtered_signal = filtered_states[:, 1] - filtered_states[:, 2]
+    filtered_eeg.append(filtered_signal)
+
+    # --- Metrics ---
+    real = zs
+    filtered = filtered_signal
+    corr, _ = pearsonr(real, filtered)
+    mse = mean_squared_error(real, filtered)
+    print(f"Channel {channel+1} | Corr: {corr:.3f}, MSE: {mse:.3f}")
+
+    # Stability
+    is_stable = np.all(np.isfinite(filtered_states)) and np.max(np.abs(filtered_states)) < 1000
+    print("Stable" if is_stable else "Unstable")
+
+    # Parameter bounds
+    A_vals, B_vals, C_vals = filtered_states[:, 6], filtered_states[:, 7], filtered_states[:, 8]
+    for name, param, low, high in zip(["A", "B", "C"], [A_vals, B_vals, C_vals], [3, 20, 100], [4, 30, 150]):
+        print(f"{name} range: {param.min():.2f}-{param.max():.2f}" +
+              (" Yes" if (param.min() >= low and param.max() <= high) else " No"))
+
+    # Power Spectrum
+    freqs, psd = welch(filtered, fs=1000, nperseg=1024)
+    alpha_band = (freqs >= 8) & (freqs <= 12)
+    peak_alpha = freqs[alpha_band][np.argmax(psd[alpha_band])]
+    print(f"Peak Alpha: {peak_alpha:.2f} Hz")
+
+    # Spectral entropy
+    psd_norm = psd / np.sum(psd)
+    spec_entropy = entropy(psd_norm)
+    print(f"Spectral Entropy: {spec_entropy:.3f}")
+
+    # Parameter RMSE (optional: if comparing to known values)
+    true_params = np.array([3.25, 22.0, 135.0])
+    param_rmse = np.sqrt(np.mean((ukf.x[6:] - true_params) ** 2))
+    print(f"Parameter RMSE: {param_rmse:.4f}\n")
+def plot_psd_comparison(real_eeg, filtered_eeg, fs=256):  # fs: sampling frequency
+    f1, Pxx_real = welch(real_eeg, fs=fs, nperseg=1024)
+    f2, Pxx_filtered = welch(filtered_eeg, fs=fs, nperseg=1024)
+
+    plt.figure(figsize=(10, 6))
+    plt.semilogy(f1, Pxx_real, label='Real EEG')
+    plt.semilogy(f2, Pxx_filtered, label='Filtered EEG')
+    plt.xlabel('Frequency (Hz)')
+    plt.ylabel('Power Spectral Density (V^2/Hz)')
+    plt.title('PSD Comparison')
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()    
+
+# --- Plot Example Channel ---
+fig, ax = plt.subplots(figsize=(15, 4))
+ax.plot(eeg_data[:, 0], label='Real EEG', alpha=0.7)
+ax.plot(filtered_eeg[0], label='Filtered EEG', alpha=0.7)
+ax.set_title("Example Channel 1")
+ax.legend()
+plt.tight_layout()
+plt.show()
+plot_psd_comparison(eeg_data[:, 0], filtered_eeg[0], fs=256)
+plt.show()
